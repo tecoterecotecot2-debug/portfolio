@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "Vitrine: a cinematic portfolio framework"
+authors:
+  - family-names: Siegloch
+    given-names: João
+version: 4.6.2
+date-released: 2026-10-02
+license: MIT
