@@ -5,17 +5,87 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
+    name: Build (Node ${{ matrix.node }})
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
+      fail-fast: false
       matrix:
-        node: [20, 22]
+        node: [22, 24]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ${{ matrix.node }}
           cache: npm
-      - run: npm ci
-      - run: npm run build
+          package-manager-cache: false
+      - name: Test evidence validation
+        run: node --test scripts/security-ci.test.mjs
+      - name: Install verified secret scanner
+        if: matrix.node == 24
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/gitleaks"
+          curl --fail --silent --show-error --location --retry 3 --proto '=https' --tlsv1.2 \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+            --output "$RUNNER_TEMP/gitleaks/download.tar.gz"
+          printf '%s  %s\n' 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb "$RUNNER_TEMP/gitleaks/download.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/gitleaks/download.tar.gz" -C "$RUNNER_TEMP/gitleaks" gitleaks
+          chmod 755 "$RUNNER_TEMP/gitleaks/gitleaks"
+      - name: Scan history and source, verify scanner rejects synthetic secret
+        if: matrix.node == 24
+        run: node scripts/security-ci.mjs source
+        env:
+          GITLEAKS_BINARY: ${{ runner.temp }}/gitleaks/gitleaks
+      - name: Check dependency advisories
+        if: matrix.node == 24
+        run: node scripts/security-ci.mjs audit
+      - name: Install locked dependencies
+        run: npm ci --ignore-scripts
+      - name: Compile production bundle
+        run: npm run build
+      - name: Scan production bundle
+        if: matrix.node == 24
+        run: node scripts/security-ci.mjs bundle
+        env:
+          GITLEAKS_BINARY: ${{ runner.temp }}/gitleaks/gitleaks
+      - name: Bind evidence to revision and bundle
+        run: node scripts/security-ci.mjs evidence
+        env:
+          EXPECTED_REVISION: ${{ github.sha }}
+          PR_HEAD_REVISION: ${{ github.event.pull_request.head.sha }}
+          CI_NODE_VERSION: ${{ matrix.node }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: build-evidence-node-${{ matrix.node }}
+          path: |
+            dist/
+            .ci-evidence/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+
+  gate:
+    name: CI gate
+    if: always()
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require every build and security step
+        env:
+          BUILD_RESULT: ${{ needs.build.result }}
+        run: test "$BUILD_RESULT" = success
